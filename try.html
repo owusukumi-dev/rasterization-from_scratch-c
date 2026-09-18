@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Software Rasterizer - 3D Rainbow Cube</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Arial', sans-serif;
+        }
+        
+        .container {
+            text-align: center;
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        canvas {
+            border: 2px solid #333;
+            border-radius: 10px;
+            display: block;
+            margin: 20px auto;
+            background: #1a1a1a;
+            cursor: pointer;
+        }
+        
+        h1 {
+            color: #333;
+            margin: 10px 0;
+            font-size: 2em;
+        }
+        
+        .controls {
+            margin: 15px 0;
+        }
+        
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 0 5px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        
+        button:hover {
+            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        
+        .info {
+            color: #666;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        
+        input[type="range"] {
+            width: 200px;
+            margin: 0 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 Software Rasterizer</h1>
+        <canvas id="canvas" width="400" height="400"></canvas>
+        
+        <div class="controls">
+            <button onclick="toggleAnimation()">⏯️ Pause/Play</button>
+            <button onclick="toggleWireframe()">🔲 Wireframe</button>
+            <button onclick="resetRotation()">🔄 Reset</button>
+        </div>
+        
+        <div class="controls">
+            <label>Speed: </label>
+            <input type="range" id="speed" min="0.5" max="3" step="0.1" value="1">
+            <span id="speedValue">1.0x</span>
+        </div>
+        
+        <div class="controls">
+            <label>Size: </label>
+            <input type="range" id="cubeSize" min="50" max="150" step="5" value="100">
+        </div>
+        
+        <div class="info">
+            Click and drag to rotate manually • Scroll to zoom
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        // Software framebuffer and z-buffer
+        let framebuffer = new Float32Array(width * height * 3);
+        let zbuffer = new Float32Array(width * height);
+        
+        // Cube vertices (8 corners of a cube)
+        const baseVertices = [
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],  // Front face
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]       // Back face
+        ];
+        
+        // Cube faces (each face defined by 4 vertex indices)
+        const faces = [
+            [0, 1, 2, 3],  // Front
+            [5, 4, 7, 6],  // Back
+            [4, 0, 3, 7],  // Left
+            [1, 5, 6, 2],  // Right
+            [3, 2, 6, 7],  // Top
+            [4, 5, 1, 0]   // Bottom
+        ];
+        
+        // Rotation state
+        let rotationX = 0;
+        let rotationY = 0;
+        let rotationZ = 0;
+        let autoRotate = true;
+        let wireframeMode = false;
+        let zoomLevel = 100;
+        
+        // Mouse interaction
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+        
+        // Clear buffers
+        function clearBuffers() {
+            framebuffer.fill(0);
+            zbuffer.fill(Infinity);
+        }
+        
+        // 3D rotation function
+        function rotateVertex(vertex, rotX, rotY, rotZ) {
+            let [x, y, z] = vertex;
+            
+            // Rotate around X axis
+            let cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+            let y1 = y * cosX - z * sinX;
+            let z1 = y * sinX + z * cosX;
+            y = y1; z = z1;
+            
+            // Rotate around Y axis
+            let cosY = Math.cos(rotY), sinY = Math.sin(rotY);
+            let x1 = x * cosY + z * sinY;
+            let z2 = -x * sinY + z * cosY;
+            x = x1; z = z2;
+            
+            // Rotate around Z axis
+            let cosZ = Math.cos(rotZ), sinZ = Math.sin(rotZ);
+            let x2 = x * cosZ - y * sinZ;
+            let y2 = x * sinZ + y * cosZ;
+            x = x2; y = y2;
+            
+            return [x, y, z];
+        }
+        
+        // Project 3D point to 2D screen
+        function projectVertex(vertex) {
+            const cameraDistance = 5;
+            const scale = cameraDistance / (cameraDistance - vertex[2]);
+            const screenX = width / 2 + vertex[0] * scale * zoomLevel;
+            const screenY = height / 2 - vertex[1] * scale * zoomLevel;
+            return [screenX, screenY, vertex[2], scale];
+        }
+        
+        // Barycentric coordinates for triangle rasterization
+        function barycentric(p, a, b, c) {
+            const v0 = [b[0] - a[0], b[1] - a[1]];
+            const v1 = [c[0] - a[0], c[1] - a[1]];
+            const v2 = [p[0] - a[0], p[1] - a[1]];
+            
+            const d00 = v0[0] * v0[0] + v0[1] * v0[1];
+            const d01 = v0[0] * v1[0] + v0[1] * v1[1];
+            const d11 = v1[0] * v1[0] + v1[1] * v1[1];
+            const d20 = v2[0] * v0[0] + v2[1] * v0[1];
+            const d21 = v2[0] * v1[0] + v2[1] * v1[1];
+            
+            const denom = d00 * d11 - d01 * d01;
+            if (Math.abs(denom) < 1e-10) return null;
+            
+            const v = (d11 * d20 - d01 * d21) / denom;
+            const w = (d00 * d21 - d01 * d20) / denom;
+            const u = 1.0 - v - w;
+            
+            return [u, v, w];
+        }
+        
+        // Rasterize a triangle into the framebuffer
+        function rasterizeTriangle(v0, v1, v2, color, intensity) {
+            // Calculate bounding box
+            const minX = Math.max(0, Math.floor(Math.min(v0[0], v1[0], v2[0])));
+            const maxX = Math.min(width - 1, Math.ceil(Math.max(v0[0], v1[0], v2[0])));
+            const minY = Math.max(0, Math.floor(Math.min(v0[1], v1[1], v2[1])));
+            const maxY = Math.min(height - 1, Math.ceil(Math.max(v0[1], v1[1], v2[1])));
+            
+            // Iterate through bounding box pixels
+            for (let y = minY; y <= maxY; y++) {
+                for (let x = minX; x <= maxX; x++) {
+                    const p = [x + 0.5, y + 0.5];
+                    const bary = barycentric(p, v0, v1, v2);
+                    
+                    if (bary && bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
+                        // Interpolate z value
+                        const z = bary[0] * v0[2] + bary[1] * v1[2] + bary[2] * v2[2];
+                        
+                        // Z-buffer test
+                        const bufferIndex = y * width + x;
+                        if (z < zbuffer[bufferIndex]) {
+                            zbuffer[bufferIndex] = z;
+                            
+                            // Write to framebuffer with lighting
+                            const fbIndex = bufferIndex * 3;
+                            framebuffer[fbIndex] = color[0] * intensity;
+                            framebuffer[fbIndex + 1] = color[1] * intensity;
+                            framebuffer[fbIndex + 2] = color[2] * intensity;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Draw line for wireframe mode
+        function drawLine(x0, y0, x1, y1, color) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x0, y0);
+            ctx.lineTo(x1, y1);
+            ctx.stroke();
+        }
+        
+        // HSV to RGB conversion
+        function hsvToRgb(h, s, v) {
+            let r, g, b;
+            const i = Math.floor(h * 6);
+            const f = h * 6 - i;
+            const p = v * (1 - s);
+            const q = v * (1 - f * s);
+            const t = v * (1 - (1 - f) * s);
+            
+            switch (i % 6) {
+                case 0: r = v; g = t; b = p; break;
+                case 1: r = q; g = v; b = p; break;
+                case 2: r = p; g = v; b = t; break;
+                case 3: r = p; g = q; b = v; break;
+                case 4: r = t; g = p; b = v; break;
+                case 5: r = v; g = p; b = q; break;
+            }
+            
+            return [r, g, b];
+        }
+        
+        // Main render function
+        function render(timestamp) {
+            clearBuffers();
+            
+            // Update rotation
+            const speedMultiplier = parseFloat(document.getElementById('speed').value);
+            if (autoRotate) {
+                rotationX += 0.02 * speedMultiplier;
+                rotationY += 0.03 * speedMultiplier;
+                rotationZ += 0.015 * speedMultiplier;
+            }
+            
+            // Get cube size from slider
+            const cubeSize = parseInt(document.getElementById('cubeSize').value);
+            
+            // Transform and project vertices
+            const transformedVertices = baseVertices.map(v => {
+                const scaled = [v[0] * cubeSize / 100, v[1] * cubeSize / 100, v[2] * cubeSize / 100];
+                const rotated = rotateVertex(scaled, rotationX, rotationY, rotationZ);
+                return projectVertex(rotated);
+            });
+            
+            // Clear canvas
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(0, 0, width, height);
+            
+            // Process each face
+            for (let i = 0; i < faces.length; i++) {
+                const face = faces[i];
+                const v0 = transformedVertices[face[0]];
+                const v1 = transformedVertices[face[1]];
+                const v2 = transformedVertices[face[2]];
+                const v3 = transformedVertices[face[3]];
+                
+                // Calculate face normal for lighting
+                const p0 = rotateVertex([baseVertices[face[0]][0] * cubeSize / 100,
+                                        baseVertices[face[0]][1] * cubeSize / 100,
+                                        baseVertices[face[0]][2] * cubeSize / 100], 
+                                        rotationX, rotationY, rotationZ);
+                const p1 = rotateVertex([baseVertices[face[1]][0] * cubeSize / 100,
+                                        baseVertices[face[1]][1] * cubeSize / 100,
+                                        baseVertices[face[1]][2] * cubeSize / 100], 
+                                        rotationX, rotationY, rotationZ);
+                const p2 = rotateVertex([baseVertices[face[2]][0] * cubeSize / 100,
+                                        baseVertices[face[2]][1] * cubeSize / 100,
+                                        baseVertices[face[2]][2] * cubeSize / 100], 
+                                        rotationX, rotationY, rotationZ);
+                
+                // Calculate normal
+                const normal = [
+                    (p1[1] - p0[1]) * (p2[2] - p0[2]) - (p1[2] - p0[2]) * (p2[1] - p0[1]),
+                    (p1[2] - p0[2]) * (p2[0] - p0[0]) - (p1[0] - p0[0]) * (p2[2] - p0[2]),
+                    (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+                ];
+                
+                // Normalize normal
+                const normalLength = Math.sqrt(normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2);
+                const normalizedNormal = normal.map(n => n / normalLength);
+                
+                // Light direction
+                const lightDir = [0.3, 0.5, 0.8];
+                const lightLength = Math.sqrt(lightDir[0] ** 2 + lightDir[1] ** 2 + lightDir[2] ** 2);
+                const normalizedLight = lightDir.map(l => l / lightLength);
+                
+                // Calculate light intensity
+                const intensity = Math.max(0.2, 
+                    normalizedNormal[0] * normalizedLight[0] +
+                    normalizedNormal[1] * normalizedLight[1] +
+                    normalizedNormal[2] * normalizedLight[2]);
+                
+                // Create rainbow color
+                const hue = (i / 6 + timestamp * 0.0001) % 1.0;
+                const color = hsvToRgb(hue, 0.8, 1.0);
+                
+                if (wireframeMode) {
+                    // Draw wireframe
+                    drawLine(v0[0], v0[1], v1[0], v1[1], `rgb(${color[0]*255},${color[1]*255},${color[2]*255})`);
+                    drawLine(v1[0], v1[1], v2[0], v2[1], `rgb(${color[0]*255},${color[1]*255},${color[2]*255})`);
+                    drawLine(v2[0], v2[1], v3[0], v3[1], `rgb(${color[0]*255},${color[1]*255},${color[2]*255})`);
+                    drawLine(v3[0], v3[1], v0[0], v0[1], `rgb(${color[0]*255},${color[1]*255},${color[2]*255})`);
+                } else {
+                    // Rasterize two triangles per face
+                    rasterizeTriangle(v0, v1, v2, color, intensity);
+                    rasterizeTriangle(v0, v2, v3, color, intensity);
+                }
+            }
+            
+            // Copy framebuffer to canvas
+            if (!wireframeMode) {
+                const imageData = ctx.createImageData(width, height);
+                for (let i = 0; i < width * height; i++) {
+                    imageData.data[i * 4] = Math.min(255, framebuffer[i * 3] * 255);
+                    imageData.data[i * 4 + 1] = Math.min(255, framebuffer[i * 3 + 1] * 255);
+                    imageData.data[i * 4 + 2] = Math.min(255, framebuffer[i * 3 + 2] * 255);
+                    imageData.data[i * 4 + 3] = 255;
+                }
+                ctx.putImageData(imageData, 0, 0);
+            }
+            
+            requestAnimationFrame(render);
+        }
+        
+        // Control functions
+        function toggleAnimation() {
+            autoRotate = !autoRotate;
+        }
+        
+        function toggleWireframe() {
+            wireframeMode = !wireframeMode;
+        }
+        
+        function resetRotation() {
+            rotationX = 0;
+            rotationY = 0;
+            rotationZ = 0;
+        }
+        
+        // Mouse controls
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            autoRotate = false;
+        });
+        
+        canvas.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const dx = e.clientX - lastMouseX;
+                const dy = e.clientY - lastMouseY;
+                rotationY += dx * 0.01;
+                rotationX += dy * 0.01;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            }
+        });
+        
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+        
+        canvas.addEventListener('mouseleave', () => {
+            isDragging = false;
+        });
+        
+        // Zoom with scroll
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            zoomLevel += e.deltaY * 0.1;
+            zoomLevel = Math.max(50, Math.min(200, zoomLevel));
+        });
+        
+        // Update speed display
+        document.getElementById('speed').addEventListener('input', (e) => {
+            document.getElementById('speedValue').textContent = e.target.value + 'x';
+        });
+        
+        // Start rendering
+        render(0);
+    </script>
+</body>
+</html>
